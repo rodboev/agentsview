@@ -93,6 +93,8 @@ class AnalyticsStore {
   topSessions = $state<TopSessionsResponse | null>(null);
   signals = $state<SignalsAnalyticsResponse | null>(null);
   topMetric: TopSessionsMetric = $state("messages");
+  lastUpdatedAt: number | null = $state(null);
+  hasNewData: boolean = $state(false);
 
   loading = $state({
     summary: false,
@@ -145,6 +147,7 @@ class AnalyticsStore {
     topSessions: 0,
     signals: 0,
   };
+  private fetchAllVersion = 0;
   private abortControllers: Partial<Record<Panel, AbortController>> = {};
 
   get timezone(): string {
@@ -169,6 +172,11 @@ class AnalyticsStore {
 
   get isQuerying(): boolean {
     return Object.values(this.querying).some(Boolean);
+  }
+
+  markNewData(): void {
+    if (this.lastUpdatedAt === null) return;
+    this.hasNewData = true;
   }
 
   clearAllFilters() {
@@ -489,6 +497,11 @@ class AnalyticsStore {
     }
   }
 
+  private markRefreshComplete(): void {
+    this.lastUpdatedAt = Date.now();
+    this.hasNewData = false;
+  }
+
   private rollDates(): void {
     if (this.isPinned) return;
     this.from = daysAgo(this.windowDays);
@@ -496,6 +509,7 @@ class AnalyticsStore {
   }
 
   async fetchAll() {
+    const fetchVersion = ++this.fetchAllVersion;
     this.rollDates();
     await Promise.all([
       this.fetchSummary(),
@@ -509,6 +523,12 @@ class AnalyticsStore {
       this.fetchTopSessions(),
       this.fetchSignals(),
     ]);
+    if (
+      fetchVersion === this.fetchAllVersion &&
+      Object.values(this.errors).every((error) => error === null)
+    ) {
+      this.markRefreshComplete();
+    }
   }
 
   async fetchSummary() {

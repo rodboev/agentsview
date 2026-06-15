@@ -218,6 +218,8 @@ function resetStore() {
   analytics.tools = null;
   analytics.topSessions = null;
   analytics.signals = null;
+  analytics.lastUpdatedAt = null;
+  analytics.hasNewData = false;
   analytics.querying = {
     summary: false,
     activity: false,
@@ -333,6 +335,34 @@ describe("AnalyticsStore.setDateRange", () => {
     expect(analyticsService.getApiV1AnalyticsSessions).toHaveBeenLastCalledWith(expected);
     expect(analyticsService.getApiV1AnalyticsVelocity).toHaveBeenLastCalledWith(expected);
     expect(analyticsService.getApiV1AnalyticsTools).toHaveBeenLastCalledWith(expected);
+  });
+});
+
+describe("AnalyticsStore freshness state", () => {
+  it("records full refresh time and clears new-data hints", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-06-15T15:00:00Z"));
+
+      await analytics.fetchAll();
+
+      expect(analytics.lastUpdatedAt).toBe(
+        new Date("2026-06-15T15:00:00Z").getTime(),
+      );
+
+      analytics.markNewData();
+      expect(analytics.hasNewData).toBe(true);
+
+      vi.setSystemTime(new Date("2026-06-15T15:05:00Z"));
+      await analytics.fetchAll();
+
+      expect(analytics.lastUpdatedAt).toBe(
+        new Date("2026-06-15T15:05:00Z").getTime(),
+      );
+      expect(analytics.hasNewData).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
