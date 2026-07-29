@@ -278,3 +278,64 @@ func TestReconcileProviderRootsKeepsSessionMovedIntoUnselectedNestedScope(t *tes
 	assert.NotNil(t, stillActive,
 		"a covering pass finds the relocated source and leaves the session active")
 }
+
+// TestReconcileProviderRootsKeepsShadowedDuplicateWhenSiblingRootUnselected
+// scripts the case a degraded pass creates when it selects only the changed
+// root: a same-identity duplicate lives in a configured sibling the pass never
+// discovers, and the baselined copy is deleted. The pass cannot see the
+// survivor, so it must not read the deletion as a lost source.
+func TestReconcileProviderRootsKeepsShadowedDuplicateWhenSiblingRootUnselected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	base := t.TempDir()
+	firstDir := filepath.Join(base, "claude-one")
+	secondDir := filepath.Join(base, "claude-two")
+	require.NoError(t, os.MkdirAll(firstDir, 0o755))
+	require.NoError(t, os.MkdirAll(secondDir, 0o755))
+
+	ids := writeNamedClaudeCorpus(t, firstDir, "shared", 3)
+	shadowedID := ids[1]
+	firstCopy := filepath.Join(firstDir, "project", shadowedID+".jsonl")
+	secondCopy := filepath.Join(secondDir, "project", shadowedID+".jsonl")
+	source, err := os.ReadFile(firstCopy)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(secondCopy), 0o755))
+	require.NoError(t, os.WriteFile(secondCopy, source, 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {firstDir, secondDir},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	engine.SyncAll(t.Context(), nil)
+	active, err := database.GetSessionFull(t.Context(), shadowedID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	require.NotNil(t, active.FilePath)
+
+	// Either copy may win the baseline; the case under test is whichever one
+	// did, deleted, with the survivor in the root this pass will not select.
+	baselined := *active.FilePath
+	selectedDir, survivor := firstDir, secondCopy
+	if baselined == secondCopy {
+		selectedDir, survivor = secondDir, firstCopy
+	} else {
+		require.Equal(t, firstCopy, baselined, "the baseline must be one of the two copies")
+	}
+
+	require.NoError(t, os.Remove(baselined))
+	require.FileExists(t, survivor, "the shadowed duplicate stays on disk")
+
+	require.NoError(t, engine.ReconcileProviderRoots(
+		t.Context(), parser.AgentClaude, []string{selectedDir}))
+
+	survived, err := database.GetSession(t.Context(), shadowedID)
+	require.NoError(t, err)
+	assert.NotNil(t, survived,
+		"a pass that never discovered the sibling root cannot prove the source is gone")
+}

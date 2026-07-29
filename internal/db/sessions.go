@@ -2276,6 +2276,21 @@ const WatchReconcileSourcePageSize = 128
 // parameter count independently of the number of configured provider roots.
 const watchReconcileOwnershipScopeBatchSize = 32
 
+// watchReconcileOwnershipScopeParamBudget bounds the bind parameters one
+// ownership query may carry. A scope costs two parameters, four more for
+// virtual members, and two per exclusion, so a scope count alone stops bounding
+// the query once exclusions ride along with the scopes. The value stays well
+// under the 999 floor older SQLite builds impose, which is itself far below the
+// 32766 the pinned driver's build allows.
+const watchReconcileOwnershipScopeParamBudget = 4000
+
+// watchReconcileScopeExclusionParamBudget bounds what one scope may spend on
+// exclusions. A scope past it renders without them and pages rows the caller
+// rejects after the read: slower, never wrong. Capping the list instead would
+// be worse than either, since the exclusions dropped are the ones whose rows
+// would fill the page.
+const watchReconcileScopeExclusionParamBudget = 2000
+
 // SessionSourceCursor is the complete keyset cursor for source ownership
 // pages. Agent is retained to prevent accidentally reusing a cursor across
 // independently ordered agent scans.
@@ -2326,8 +2341,8 @@ func (db *DB) ListActiveSessionSourceOwnershipScopesPage(
 		)
 	}
 	var ownership []SessionSourceOwnership
-	for start := 0; start < len(scopes); start += watchReconcileOwnershipScopeBatchSize {
-		end := min(start+watchReconcileOwnershipScopeBatchSize, len(scopes))
+	for start := 0; start < len(scopes); {
+		end := ownershipScopeBatchEnd(scopes, start)
 		page, err := db.listActiveSessionSourceOwnershipScopeBatch(
 			ctx, machine, agent, scopes[start:end], after,
 		)
@@ -2337,8 +2352,36 @@ func (db *DB) ListActiveSessionSourceOwnershipScopesPage(
 		ownership = mergeSessionSourceOwnershipPages(
 			ownership, page, WatchReconcileSourcePageSize,
 		)
+		start = end
 	}
 	return ownership, nil
+}
+
+// ownershipScopeBatchEnd returns the exclusive end of the batch starting at
+// start: as many scopes as fit under both the scope count and the bind
+// parameter budget, and never fewer than one, so the loop always advances.
+func ownershipScopeBatchEnd(scopes []StoredSourcePathHintScope, start int) int {
+	params := 0
+	end := start
+	for end < len(scopes) {
+		cost := ownershipScopeParamCost(scopes[end])
+		if end > start &&
+			(end-start >= watchReconcileOwnershipScopeBatchSize ||
+				params+cost > watchReconcileOwnershipScopeParamBudget) {
+			break
+		}
+		params += cost
+		end++
+	}
+	return end
+}
+
+func ownershipScopeParamCost(scope StoredSourcePathHintScope) int {
+	cost := 2
+	if scope.IncludeVirtualMembers {
+		cost += 4
+	}
+	return cost + 2*len(renderableScopeExclusions(scope))
 }
 
 func (db *DB) listActiveSessionSourceOwnershipScopeBatch(
@@ -2368,7 +2411,7 @@ func (db *DB) listActiveSessionSourceOwnershipScopeBatch(
 		}
 		var exclusionClause string
 		exclusionClause, args = storedSourcePathHintExclusionSQL(
-			"b.file_path", scope.Excluded, args,
+			"b.file_path", renderableScopeExclusions(scope), args,
 		)
 		if exclusionClause != "" {
 			rootClause = `(` + rootClause + exclusionClause + `)`
@@ -2896,7 +2939,37 @@ func normalizeExcludedHintRoots(root string, excluded []string) []string {
 		out = append(out, stored)
 	}
 	sort.Strings(out)
+	return compactHintRoots(out)
+}
+
+// compactHintRoots drops an exclusion already covered by a shallower one. A
+// configured tree usually declares nested archives, and each redundant
+// exclusion costs SQL expression depth and two bind parameters without
+// removing a row the shallower one leaves in.
+//
+// The input is sorted, so an ancestor always precedes its descendants.
+func compactHintRoots(roots []string) []string {
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		covered := slices.ContainsFunc(out, func(kept string) bool {
+			return strings.HasPrefix(root, hintRootPrefix(kept))
+		})
+		if covered {
+			continue
+		}
+		out = append(out, root)
+	}
 	return out
+}
+
+// renderableScopeExclusions returns the exclusions a scope may render. All of
+// them, or none: a partial list leaves exactly the rows the dropped exclusions
+// would have removed, and those are the rows that fill the page.
+func renderableScopeExclusions(scope StoredSourcePathHintScope) []string {
+	if 2*len(scope.Excluded) > watchReconcileScopeExclusionParamBudget {
+		return nil
+	}
+	return scope.Excluded
 }
 
 func intersectHintRoots(left, right []string) []string {
@@ -2942,8 +3015,9 @@ func storedSourcePathHintQuery(
 		if root == "" || root == "." {
 			continue
 		}
+		scopeExclusions := renderableScopeExclusions(scope)
 		exclusion, _ := storedSourcePathHintExclusionSQL(
-			"file_path", scope.Excluded, nil,
+			"file_path", scopeExclusions, nil,
 		)
 		appendSelect := func(predicate string, values ...any) {
 			selects = append(selects, `SELECT file_path
@@ -2955,7 +3029,7 @@ func storedSourcePathHintQuery(
 			args = append(args, agent)
 			args = append(args, values...)
 			_, args = storedSourcePathHintExclusionSQL(
-				"file_path", scope.Excluded, args,
+				"file_path", scopeExclusions, args,
 			)
 		}
 		descendantPrefix, descendantEnd := activeSessionSourceBounds(root)

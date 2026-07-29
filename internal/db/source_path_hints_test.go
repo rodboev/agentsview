@@ -1441,3 +1441,99 @@ func TestNormalizeExcludedHintRootsHandlesVolumeAndUnresolvableRoots(t *testing.
 		assert.False(t, storedSourcePathHintExcluded("\x00", []string{root}))
 	})
 }
+
+// TestListActiveSessionSourceOwnershipScopesPageBoundsHighCardinalityExclusions
+// covers the shape a deep configured tree produces: many sibling roots
+// excluded from one scope. Each exclusion costs two predicates and two bind
+// parameters per scope, so an unbounded render can exceed SQLite's expression
+// depth or variable limit and fail the pass outright rather than degrade.
+func TestListActiveSessionSourceOwnershipScopesPageBoundsHighCardinalityExclusions(t *testing.T) {
+	d := testDB(t)
+	root := t.TempDir()
+
+	excluded := make([]string, 0, 400)
+	seeds := make([]storedSourcePathSeed, 0, 420)
+	for i := range 400 {
+		nested := filepath.Join(root, fmt.Sprintf("archive-%04d", i))
+		excluded = append(excluded, nested)
+		seeds = append(seeds, storedSourcePathSeed{
+			id:    fmt.Sprintf("nested-%04d", i),
+			agent: "claude",
+			path:  filepath.Join(nested, "session.jsonl"),
+		})
+	}
+	selectedIDs := make([]string, 0, 3)
+	for i := range 3 {
+		id := fmt.Sprintf("selected-%04d", i)
+		selectedIDs = append(selectedIDs, id)
+		seeds = append(seeds, storedSourcePathSeed{
+			id:    id,
+			agent: "claude",
+			path:  filepath.Join(root, fmt.Sprintf("session-%04d.jsonl", i)),
+		})
+	}
+	insertSessionsWithSourcePaths(t, d, seeds)
+	require.NoError(t, d.BaselineActiveSessionSourcePaths(
+		t.Context(), defaultMachine, sourcePathsFromSeeds(seeds),
+	))
+
+	scopes := make([]StoredSourcePathHintScope, 0, 40)
+	for i := range 40 {
+		scopes = append(scopes, StoredSourcePathHintScope{
+			Path:                  root,
+			IncludeVirtualMembers: i%2 == 0,
+			Excluded:              excluded,
+		})
+	}
+
+	page, err := d.ListActiveSessionSourceOwnershipScopesPage(
+		t.Context(), defaultMachine, "claude", scopes, SessionSourceCursor{},
+	)
+	require.NoError(t, err, "a high-cardinality exclusion set must not fail the query")
+
+	normalized := normalizeStoredSourcePathHintScopes(scopes)
+	require.Len(t, normalized, 1, "repeated declarations of one path merge")
+	assert.Len(t, normalized[0].Excluded, len(excluded),
+		"sibling exclusions are not compacted away, so all of them must render")
+	assert.LessOrEqual(t, ownershipScopeParamCost(normalized[0]),
+		watchReconcileOwnershipScopeParamBudget,
+		"one scope must fit the per-query parameter budget on its own")
+
+	got := make([]string, 0, len(page))
+	for _, ownership := range page {
+		got = append(got, ownership.ID)
+	}
+	assert.Equal(t, selectedIDs, got,
+		"a high-cardinality exclusion set still keeps the excluded archive out of the page")
+}
+
+// TestRenderableScopeExclusionsDegradesWholeSetPastBudget pins the shape of the
+// overflow: all exclusions render or none do. A partial list would leave
+// exactly the rows the dropped exclusions were there to remove.
+func TestRenderableScopeExclusionsDegradesWholeSetPastBudget(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "claude")
+	within := make([]string, 0, watchReconcileScopeExclusionParamBudget/2)
+	for i := range watchReconcileScopeExclusionParamBudget / 2 {
+		within = append(within, filepath.Join(base, fmt.Sprintf("a-%05d", i)))
+	}
+	assert.Len(t, renderableScopeExclusions(
+		StoredSourcePathHintScope{Path: base, Excluded: within},
+	), len(within), "a set inside the budget renders whole")
+
+	over := append(append([]string{}, within...), filepath.Join(base, "one-too-many"))
+	assert.Empty(t, renderableScopeExclusions(
+		StoredSourcePathHintScope{Path: base, Excluded: over},
+	), "a set past the budget renders as none, never as a prefix of itself")
+}
+
+func TestCompactHintRootsDropsCoveredDescendants(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "claude")
+	parent := filepath.Join(base, "archive")
+	child := filepath.Join(parent, "2026")
+	grandchild := filepath.Join(child, "07")
+	sibling := filepath.Join(base, "other")
+
+	got := compactHintRoots([]string{parent, child, grandchild, sibling})
+	assert.Equal(t, []string{parent, sibling}, got,
+		"a descendant of a kept exclusion removes no additional row")
+}
