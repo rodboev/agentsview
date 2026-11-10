@@ -12,7 +12,7 @@ on:
   workflow_call:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, test/docs-release-4-negative]
   # Run on every pull request regardless of base branch so stacked PRs that
   # target another feature branch (not just main) still get the full test,
   # lint, and e2e suite. The expensive desktop/tauri bundle builds are gated
