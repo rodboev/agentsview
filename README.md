@@ -67,7 +67,6 @@ agentsview daemon restart  # restart from current configuration
 agentsview daemon stop     # stop the server, web UI, and sync
 agentsview session list    # read from the daemon if warm, otherwise SQLite
 agentsview report usage daily     # print daily cost summary
-agentsview agent setup
 ```
 
 On first run, agentsview discovers sessions from every supported agent on your
